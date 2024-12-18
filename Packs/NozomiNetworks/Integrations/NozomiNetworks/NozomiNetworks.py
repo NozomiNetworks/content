@@ -10,32 +10,73 @@ urllib3.disable_warnings()
 
 
 class Client:
-    def __init__(self, base_url=None, headers=None, verify=None, proxies=None, auth=None):
+    def __init__(self, base_url=None, verify=None, auth_credentials=None, use_basic_auth=None, bearer_token=None, proxy=None):
         self.base_url = base_url or demisto.params().get('endpoint')
-        self.headers = headers or {'accept': "application/json"}
         self.verify = verify if verify is not None else not demisto.params().get('insecure', True)
-        self.proxies = proxies if proxies is not None else demisto.params().get('proxy', False)
-        self.auth = auth or (
+        self.proxy = proxy or demisto.params().get('proxy', False)
+        self.auth_credentials = auth_credentials or (
             demisto.params().get("credentials", {}).get('identifier', ''),
             demisto.params().get("credentials", {}).get('password', '')
         )
+        self.bearer_token = bearer_token or None
+        self.use_basic_auth = use_basic_auth or False
+
+    def sign_in(self):
+        payload = {
+            "key_name": self.auth_credentials[0],
+            "key_token": self.auth_credentials[1]
+        }
+        try:
+            response = requests.post(f"{self.base_url}/api/open/sign_in", json=payload, verify=self.verify, proxies=self.get_proxies())
+            if response.status_code != 200:
+                raise Exception(f"Authentication failed with status code {response.status_code}: {response.text}")
+
+            self.bearer_token = response.headers.get("Authorization")
+            self.use_basic_auth = False
+        except Exception as e:
+            demisto.info(f"Sign-in failed: {str(e)}. Falling back to basic authentication.")
+            self.use_basic_auth = True
+
+
+    def get_proxies(self):
+        if self.proxy:
+            return handle_proxy()
+        else:
+            return {}
+
+
+    def get_headers(self):
+        if self.use_basic_auth:
+            return {
+                "accept": "application/json"
+            }
+        return {
+            "accept": "application/json",
+            "Authorization": f"{self.bearer_token}"
+        }
 
     def _make_request(self, method, path, **kwargs):
         url = self.base_url + path
-        demisto.info("Nozomi url " + url)
+
+        if not self.bearer_token and not self.use_basic_auth:
+            demisto.info(f"Token missing. Signing in.")
+            self.sign_in()
+
+        if self.use_basic_auth:
+            kwargs['auth'] = self.auth_credentials
+
         response = requests.request(
             method=method,
             url=url,
-            headers=self.headers,
+            headers=self.get_headers(),
             verify=self.verify,
-            proxies=self.proxies,
-            auth=self.auth,
+            proxies=self.get_proxies(),
             **kwargs
         )
 
         if response.status_code not in (200, 201, 202, 204):
-            demisto.info(f"Nozomi Unexpected status code: {response.status_code}. Returning empty JSON.")
-            return {"result": {}, "error": f"Unexpected status code: {response.status_code}"}
+            demisto.info(f"Unexpected status code: {response.status_code}. path {path} Returning empty JSON.")
+            return {"result": None, "error": f"Unexpected status code: {response.status_code}"}
 
         return response.json()
 
@@ -52,8 +93,8 @@ QUERY_PATH = '/api/open/query/do?query='
 QUERY_ALERTS_PATH = '/api/open/query/do?query=alerts'
 QUERY_ASSETS_PATH = '/api/open/query/do?query=assets | sort id'
 JOB_STATUS_MAX_RETRY = 5
-DEFAULT_HEAD_ALERTS = 20
 DEFAULT_HEAD_ASSETS = 50
+DEFAULT_HEAD_ALERTS = 20
 DEFAULT_HEAD_QUERY = 500
 MAX_ASSETS_FINDABLE_BY_A_COMMAND = 100
 DEFAULT_ASSETS_FINDABLE_BY_A_COMMAND = 50
@@ -133,10 +174,11 @@ def has_last_run(lr):
     return lr is not None and 'last_fetch' in lr
 
 
-def incidents_better_than_time(st, head, risk, also_n2os_incidents, client):
+def incidents_better_than_time(st, risk, also_n2os_incidents, client):
+    head = demisto.params().get('incidentPerRun', DEFAULT_HEAD_ALERTS)
     return client.http_get_request(
         f'{QUERY_ALERTS_PATH} | sort record_created_at asc | sort id asc{better_than_time_filter(st)}'
-        f'{risk_filter(risk)}{also_n2os_incidents_filter(also_n2os_incidents)} | head {head}'
+        f'{risk_filter(risk)}{also_n2os_incidents_filter(also_n2os_incidents)} | head {min(int(head), 1000)}'
     )['result']
 
 
@@ -159,6 +201,8 @@ def risk_filter(risk):
 
 
 def incidents_better_than_id(incidents_to_filter, the_id):
+    if incidents_to_filter is None:
+        return []
     return [incident for incident in incidents_to_filter if incident['id'] > the_id]
 
 
@@ -171,14 +215,17 @@ def incidents_equal_time_better_id(st, last_id, risk, also_n2os_incidents, clien
         return []
 
 
-def incidents(st, last_id, last_run, risk, also_n2os_incidents, client, head=DEFAULT_HEAD_ALERTS):
+def incidents(st, last_id, last_run, risk, also_n2os_incidents, client):
     def get_incident_name(i):
         return i['name']
 
-    ibtt = incidents_better_than_time(st, head, risk, also_n2os_incidents, client)
+    ibtt = incidents_better_than_time(st, risk, also_n2os_incidents, client)
 
     lft = last_fetched_time(ibtt, last_run)
     lfid = last_fetched_id(ibtt, last_run)
+
+    if ibtt is None:
+        return [], lft, lfid
 
     incidents_merged = incidents_equal_time_better_id(st, last_id, risk, also_n2os_incidents, client) + ibtt
 
@@ -192,11 +239,13 @@ def incidents(st, last_id, last_run, risk, also_n2os_incidents, client, head=DEF
 
 
 def last_fetched_time(inc, last_run):
-    return inc[-1]['record_created_at'] if len(inc) > 0 else last_run.get("last_fetch", 0)
+    if inc and len(inc) > 0 and 'record_created_at' in inc[-1]:
+        return inc[-1]['record_created_at']
+    return last_run.get("last_fetch", 0)
 
 
 def last_fetched_id(inc, last_run):
-    return inc[-1]['id'] if len(inc) > 0 else last_run.get("last_id", None)
+    return inc[-1]['id'] if inc and len(inc) > 0 else last_run.get("last_id", None)
 
 
 def last_asset_id(response):
@@ -208,6 +257,9 @@ def ack_unack_alerts(ids, status, client):
     for id in ids:
         data.append({'id': id, 'ack': status})
     response = client.http_post_request('/api/open/alerts/ack', {'data': data})
+
+    if 'error' in response and response['error']:
+        return None
 
     return response.get("result", {}).get("id", None)
 
@@ -369,6 +421,8 @@ def find_assets(args, client, head=DEFAULT_HEAD_ASSETS):
     while limit > len(result) and are_there_assets_to_request:
         raw_response = client.http_get_request(
             f'{QUERY_ASSETS_PATH}{filter_from_args(args)}{better_than_id_filter(last_id)} | head {head}')
+        if raw_response['result'] is None:
+            continue
         last_id = last_asset_id(raw_response['result'])
         are_there_assets_to_request = head == len(raw_response['result'])
         result = result + raw_response['result']
@@ -450,7 +504,7 @@ def main():
         elif demisto.command() == 'nozomi-find-ip-by-mac':
             return_results(CommandResults(**find_ip_by_mac(demisto.args(), client)))
     except Exception as e:
-        error_message = f"Nozomi Error of type {type(e).__name__} occurred: {str(e)}"
+        error_message = f"Error of type {type(e).__name__} occurred: {str(e)}"
         demisto.error(error_message)
         return_error(error_message)
 

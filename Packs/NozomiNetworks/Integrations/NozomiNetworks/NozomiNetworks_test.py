@@ -1,8 +1,8 @@
 import pytest
 from NozomiNetworks import *
-import demistomock as demisto  # Assuming you're using demistomock
+import demistomock as demisto
+from unittest.mock import MagicMock, patch
 
-# Mock the `callingContext` before invoking your client or code that needs it
 demisto.callingContext = {
     'context': {
         'IntegrationBrand': 'NozomiNetworks'
@@ -12,12 +12,25 @@ demisto.callingContext = {
 NOZOMIGUARDIAN_URL = 'https://test.com'
 
 
-@pytest.mark.parametrize('obj, expected', [({'last_id': "an_id"}, True), ({}, False), (None, False), ])
+def mock_sign_in(client):
+    client.bearer_token = "mock_access_token"
+    client.token_expiry = datetime.now() + timedelta(seconds=1800)
+    client.use_basic_auth = False
+
+
+@pytest.fixture
+def client_with_mock_sign_in():
+    client = Client(base_url=NOZOMIGUARDIAN_URL)
+    client.sign_in = MagicMock(side_effect=lambda: mock_sign_in(client))
+    return client
+
+
+@pytest.mark.parametrize('obj, expected', [({'last_id': "an_id"}, True), ({}, False), (None, False)])
 def test_has_last_id(obj, expected):
     assert has_last_id(obj) is expected
 
 
-@pytest.mark.parametrize('obj, expected', [({'last_fetch': "a_timestamp"}, True), ({}, False), (None, False), ])
+@pytest.mark.parametrize('obj, expected', [({'last_fetch': "a_timestamp"}, True), ({}, False), (None, False)])
 def test_has_last_run(obj, expected):
     assert has_last_run(obj) is expected
 
@@ -60,6 +73,23 @@ def test_time_filter(obj, expected):
 )
 def test_equal_time_filter_with_ts(obj, expected):
     assert equal_than_time_filter(obj) == expected
+
+
+def test_incidents_when_ibtt_is_none(requests_mock):
+    st = '1392048082000'
+    last_id = None
+    last_run = {'last_fetch': '1392048082000'}
+    risk = '4'
+    also_n2os_incidents = True
+
+    client = __get_client([], requests_mock)
+
+    with patch('NozomiNetworks.incidents_better_than_time', return_value=None):
+        incidents_result, lft, lfid = incidents(st, last_id, last_run, risk, also_n2os_incidents, client)
+
+        assert incidents_result == []
+        assert lft == last_run.get('last_fetch', st)
+        assert lfid == last_run.get('last_id', last_id)
 
 
 def test_parse_incidents():
@@ -128,6 +158,14 @@ def test_incidents_better_than_id():
     assert filtered == [{'id': 'b'}, {'id': 'f'}]
 
 
+def test_response_with_error():
+    client = MagicMock()
+
+    client.http_post_request.return_value = {'error': "pippo"}
+
+    assert ack_unack_alerts(ids=[1, 2, 3], status=True, client=client) is None
+
+
 def test_incidents_filtered(requests_mock):
     fi, lr, lid = incidents(
         '1392048082000',
@@ -154,10 +192,19 @@ def test_nozomi_alerts_ids_from_demisto_incidents():
 
 
 def test_is_alive(requests_mock):
-    assert is_alive(
-        __get_client(
-            [{'json': __load_test_data('./test_data/alive.json'), 'path': '/api/open/query/do?query=alerts | count'}],
-            requests_mock)) == 'ok'
+    requests_mock.post(f"{NOZOMIGUARDIAN_URL}/api/open/sign_in", json={
+        "access_token": "mock_access_token",
+        "token_type": "Bearer",
+        "expires_in": 1800
+    })
+
+    requests_mock.get(f"{NOZOMIGUARDIAN_URL}/api/open/query/do?query=alerts | count", json={
+        "result": [{"count": 126}],
+        "total": 1
+    })
+
+    client = Client(base_url=NOZOMIGUARDIAN_URL)
+    assert is_alive(client) == 'ok'
 
 
 def test_ids_from_incidents():
@@ -189,6 +236,27 @@ def test_find_assets(requests_mock):
     assert len(result['outputs']) == 8
     assert result['outputs_key_field'] == 'id'
     assert result['outputs_prefix'] == 'Nozomi.Asset'
+
+
+def test_find_assets_with_none_result_in_loop(requests_mock):
+    response_sequence = [
+        {"result": None},
+        {"result": [{"id": "1", "name": "Asset 1"}]}
+    ]
+
+    client = MagicMock()
+    client.http_get_request = MagicMock(side_effect=response_sequence)
+
+    args = {}
+    head = 10
+    result = find_assets(args, client, head=head)
+
+    client.http_get_request.assert_called()
+    assert len(result['outputs']) == 1
+    assert result['outputs'][0]['id'] == "1"
+    assert "Nozomi.Asset" in result['outputs_prefix']
+    assert result['outputs_key_field'] == "id"
+    assert "Asset 1" in result['readable_output']
 
 
 def test_assets_limit_from_args():
@@ -295,6 +363,65 @@ def test_ip_from_mac_not_found(requests_mock):
     assert result['outputs'] is None
 
 
+def test_incidents_head_limit(requests_mock):
+    import urllib.parse
+
+    query = "alerts | sort record_created_at asc | sort id asc | where record_created_at > 1392048082000 | where risk >= 4 | head 20"
+    request_path = f"/api/open/query/do?query={urllib.parse.quote(query)}"
+
+    client = __get_client(
+        [
+            {
+                'json': {
+                    "result": [
+                        {
+                            "id": 1,
+                            "name": "Mock Incident 1",
+                            "record_created_at": 1392048082001,
+                            "risk": 4.5  # Example field for severity parsing
+                        },
+                        {
+                            "id": 2,
+                            "name": "Mock Incident 2",
+                            "record_created_at": 1392048082002,
+                            "risk": 3.0
+                        }
+                    ],
+                    "total": 2
+                },
+                'path': request_path
+            }
+        ],
+        requests_mock
+    )
+
+    incidents_result, lft, lfid = incidents(
+        '1392048082000',
+        None,
+        {},
+        '4',
+        True,
+        client
+    )
+
+    assert requests_mock.called
+    assert lft == 1392048082002
+    assert lfid == 2
+    assert len(incidents_result) == 2
+    assert incidents_result[0]['name'] == "Mock Incident 1_1"
+    assert incidents_result[1]['name'] == "Mock Incident 2_2"
+
+
+def test_last_fetched_time_empty_incidents():
+    last_run = {'last_fetch': 1392048082000}
+    result = last_fetched_time([], last_run)
+    assert result == 1392048082000
+
+    incidents = [{'id': 1}]
+    result = last_fetched_time(incidents, last_run)
+    assert result == 1392048082000
+
+
 def test_query_count_alerts(requests_mock):
     result = query(
         {'query': 'alerts | count'},
@@ -312,16 +439,104 @@ def test_query_count_alerts(requests_mock):
     assert result['outputs_key_field'] == ''
 
 
+def test_sign_in(client_with_mock_sign_in):
+    client = client_with_mock_sign_in
+    client.sign_in()
+    assert client.bearer_token == "mock_access_token"
+    assert not client.use_basic_auth
+
+
+def test_fallback_to_basic_auth_real_logic(requests_mock, capfd):
+    with capfd.disabled():
+        client = Client(base_url=NOZOMIGUARDIAN_URL)
+        requests_mock.post(f"{NOZOMIGUARDIAN_URL}/api/open/sign_in", status_code=500)
+        try:
+            client.sign_in()
+        except Exception as e:
+            assert "Authentication failed" in str(e)
+
+        assert client.use_basic_auth
+
+def test_sign_in_successful(requests_mock):
+    requests_mock.post(f"{NOZOMIGUARDIAN_URL}/api/open/sign_in", json={}, status_code=200, headers={"Authorization": "Bearer mock_token"})
+
+    client = Client(base_url=NOZOMIGUARDIAN_URL, auth_credentials=("mock_key", "mock_token"))
+    client.sign_in()
+
+    assert client.bearer_token == "Bearer mock_token"
+    assert not client.use_basic_auth
+
+
+def test_sign_in_failure_with_auth_fallback(requests_mock):
+    requests_mock.post(f"{NOZOMIGUARDIAN_URL}/api/open/sign_in", status_code=401, text="Unauthorized")
+
+    client = Client(base_url=NOZOMIGUARDIAN_URL, auth_credentials=("mock_key", "mock_token"))
+    client.sign_in()
+
+    assert client.bearer_token is None
+    assert client.use_basic_auth
+
+
+def test_sign_in_exception_handling(requests_mock):
+    requests_mock.post(f"{NOZOMIGUARDIAN_URL}/api/open/sign_in", exc=requests.exceptions.ConnectionError)
+
+    client = Client(base_url=NOZOMIGUARDIAN_URL, auth_credentials=("mock_key", "mock_token"))
+    client.sign_in()
+
+    assert client.bearer_token is None
+    assert client.use_basic_auth
+
+@patch('NozomiNetworks.handle_proxy')
+def test_get_proxies_with_proxy_enabled(mock_handle_proxy):
+    mock_handle_proxy.return_value = {'http': 'http://proxy.com'}
+
+    client = Client(base_url="https://test.com", proxy=True)
+    proxies = client.get_proxies()
+
+    assert proxies == {'http': 'http://proxy.com'}
+    mock_handle_proxy.assert_called_once()
+
+def test_get_proxies_without_proxy():
+    client = Client(base_url="https://test.com", proxy=False)
+    proxies = client.get_proxies()
+    assert proxies == {}
+
+def test_get_proxies_with_none_proxy():
+    client = Client(base_url="https://test.com", proxy=None)
+    proxies = client.get_proxies()
+    assert proxies == {}
+
+
+@pytest.mark.parametrize("use_basic_auth, bearer_token, expected_headers", [
+    (True, "dummy_token", {"accept": "application/json"}),
+    (False, "Bearer my_token", {"accept": "application/json", "Authorization": "Bearer my_token"}),
+    (True, None, {"accept": "application/json"})
+])
+def test_get_headers(use_basic_auth, bearer_token, expected_headers):
+    client = Client(bearer_token=bearer_token, use_basic_auth= use_basic_auth)
+    assert client.get_headers() == expected_headers
+
+
 def __get_client(dummy_responses, requests_mock):
+    requests_mock.post(f"{NOZOMIGUARDIAN_URL}/api/open/sign_in", json={
+        "access_token": "mock_access_token",
+        "token_type": "Bearer",
+        "expires_in": 1800
+    })
+
     for dummy_response in dummy_responses:
         requests_mock.get(
             f'{NOZOMIGUARDIAN_URL}{dummy_response["path"]}',
             json=dummy_response["json"]
         )
-    return Client(
-        f'{NOZOMIGUARDIAN_URL}',
-        auth=('test', 'test')
+
+    client = Client(
+        base_url=NOZOMIGUARDIAN_URL
     )
+
+    client.sign_in()
+
+    return client
 
 
 def __load_test_data(json_path):
